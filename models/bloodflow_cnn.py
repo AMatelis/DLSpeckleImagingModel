@@ -13,7 +13,7 @@ class SEBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, d, h, w = x.size()
-        squeeze = x.view(b, c, -1).mean(dim=2)  # Global Average Pooling (spatial+temporal)
+        squeeze = x.view(b, c, -1).mean(dim=2)  # Global Average Pooling (spatial + temporal)
         excitation = F.relu(self.fc1(squeeze))
         excitation = torch.sigmoid(self.fc2(excitation))
         excitation = excitation.view(b, c, 1, 1, 1)
@@ -53,16 +53,15 @@ class BloodFlowCNN(nn.Module):
             nn.LeakyReLU(inplace=True),
             nn.MaxPool3d(kernel_size=(2, 2, 2)),
 
-            # SEBlock inserted here to leverage spatial features better
             SEBlock(base_channels * 4, reduction=reduction),
 
             nn.Conv3d(base_channels * 4, base_channels * 8, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(base_channels * 8),
             nn.LeakyReLU(inplace=True),
-            nn.AdaptiveAvgPool3d((1, 1, 1)),  # output: [B, C, 1, 1, 1]
+            nn.AdaptiveAvgPool3d((1, 1, 1)),  # Output shape: [B, C, 1, 1, 1]
         )
 
-        # We'll infer the flattened feature size dynamically after a dummy forward
+        # Feature dimension will be set dynamically on first forward pass
         self._feature_dim: Optional[int] = None
 
         self.dropout = nn.Dropout(dropout_rate)
@@ -73,17 +72,15 @@ class BloodFlowCNN(nn.Module):
         self._initialize_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Validate input shape
         self._validate_input_shape(x)
 
         x = self.input_norm(x)
         x = self.encoder(x)
-        x = torch.flatten(x, 1)  # Flatten all except batch dim
+        x = torch.flatten(x, 1)  # Flatten except batch dim
 
-        # Lazy init feature dim if not set (allows dynamic input size)
+        # Lazy initialization of fc layers to match feature dim dynamically
         if self._feature_dim is None:
             self._feature_dim = x.size(1)
-            # Re-initialize fully connected layers with correct input dim
             self.fc1 = nn.Linear(self._feature_dim, self.fc1.out_features).to(x.device)
             self.fc2 = nn.Linear(self.fc1.out_features, 1).to(x.device)
             self._initialize_weights()
@@ -95,7 +92,7 @@ class BloodFlowCNN(nn.Module):
         return x
 
     def _initialize_weights(self):
-        """Initialize weights with Kaiming normal."""
+        """Kaiming normal initialization."""
         for m in self.modules():
             if isinstance(m, (nn.Conv3d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
@@ -124,10 +121,7 @@ class BloodFlowCNN(nn.Module):
 
 
 def test_model():
-    """
-    Sanity check: Runs a forward pass with dummy input on available device.
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     model = BloodFlowCNN().to(device)
     model.eval()
     dummy_input = torch.randn(2, 1, 16, 128, 128).to(device)  # [B, C, T, H, W]
