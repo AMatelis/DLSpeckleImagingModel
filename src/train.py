@@ -184,7 +184,7 @@ class SpeckleDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
         video_path, start_idx = self.samples[idx]
         if self.cache_frames and video_path in self.video_frames_cache:
             frames = self.video_frames_cache[video_path][start_idx:start_idx + self.sequence_len]
@@ -204,7 +204,7 @@ class SpeckleDataset(Dataset):
 
 
 # ------------------------------
-# Model: 3D CNN with Positive Output Activation
+# SpeckleRegressor (3D CNN Model)
 # ------------------------------
 
 class SpeckleRegressor(nn.Module):
@@ -260,7 +260,7 @@ def train_one_epoch(
         targets_scaled = torch.tensor(scaler.transform(targets_np), dtype=torch.float32, device=device).flatten()
 
         optimizer.zero_grad()
-        with torch.amp.autocast(device_type='cpu'):
+        with torch.amp.autocast(device_type='cuda' if device.type == 'cuda' else 'cpu'):
             outputs = model(inputs).flatten()
             loss = criterion(outputs, targets_scaled)
 
@@ -289,7 +289,7 @@ def validate(
     with torch.no_grad():
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast(device_type='cuda' if device.type == 'cuda' else 'cpu'):
                 outputs = model(inputs).flatten()
                 targets_np = targets.cpu().numpy().reshape(-1, 1)
                 targets_scaled = scaler.transform(targets_np).flatten()
@@ -332,7 +332,7 @@ def train_and_evaluate(
     best_val_loss = float('inf')
     epochs_no_improve = 0
     train_losses = []
-    scaler_amp = torch.cuda.amp.GradScaler()  # Mixed precision
+    scaler_amp = torch.cuda.amp.GradScaler()  # Mixed precision scaler
     best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
 
     writer = SummaryWriter(log_dir=output_dir)
@@ -447,26 +447,30 @@ def parse_args():
     parser.add_argument("--sequence_len", type=int, default=5)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--normalize_mode", type=str, choices=["scale", "zscore"], default="scale")
-    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--num_epochs", type=int, default=10)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--val_samples", type=int, default=50)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
     parser.add_argument("--test_split", type=float, default=0.2)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="Max norm for gradient clipping. Set 0 to disable.")
-    parser.add_argument("--cache_frames", action='store_true', help="Cache video frames in memory (uses more RAM).")
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--grad_clip", type=float, default=5.0)
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to model checkpoint to resume training")
+    parser.add_argument("--val_samples", type=int, default=120, help="Number of validation samples to save predictions for")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    set_seed()
 
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
     logger = setup_logger(args.output_dir)
-    logger.info("Starting training...")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+
+    set_seed()
 
     train_loader, val_loader = create_data_loaders(
         data_dir=args.data_dir,
@@ -476,13 +480,19 @@ def main():
         normalize_mode=args.normalize_mode,
         test_split=args.test_split,
         num_workers=args.num_workers,
-        cache_frames=args.cache_frames
     )
 
     model = SpeckleRegressor().to(device)
+
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, verbose=True)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+
+    if args.resume_checkpoint and os.path.isfile(args.resume_checkpoint):
+        logger.info(f"Loading checkpoint {args.resume_checkpoint}")
+        checkpoint = torch.load(args.resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint)
+        logger.info("Checkpoint loaded.")
 
     train_and_evaluate(
         model=model,
