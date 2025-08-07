@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from typing import Optional, Tuple, List
 
-from src.dataset import SpeckleDataset
+from src.dataset import SpeckleDataset  # Your dataset class that accepts stacks and labels
 
 
 def extract_flowrate_from_filename(filename: str) -> Optional[float]:
@@ -129,7 +129,7 @@ def create_dataloaders(
 ) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
     """
     Create PyTorch DataLoaders for train and validation datasets.
-    Uses fixed seed for reproducibility, no random calls outside torch.Generator.
+    Runs only on CPU.
     """
     stacks, labels = prepare_dataset(
         data_folder=data_folder,
@@ -138,7 +138,6 @@ def create_dataloaders(
         cache_file=cache_file,
     )
 
-    # Reproducible shuffle using torch.Generator
     gen = torch.Generator()
     gen.manual_seed(seed)
     indices = torch.randperm(len(stacks), generator=gen).tolist()
