@@ -5,16 +5,21 @@ from typing import Optional
 
 
 class SEBlock(nn.Module):
-    """Squeeze-and-Excitation block for adaptive channel weighting."""
+    """
+    Squeeze-and-Excitation block for adaptive channel weighting.
+    Improves representational power by re-scaling channels based on global context.
+    """
     def __init__(self, channels: int, reduction: int = 16):
-        super(SEBlock, self).__init__()
-        self.fc1 = nn.Linear(channels, channels // reduction)
-        self.fc2 = nn.Linear(channels // reduction, channels)
+        super().__init__()
+        reduced = max(channels // reduction, 1)
+        self.fc1 = nn.Linear(channels, reduced, bias=True)
+        self.fc2 = nn.Linear(reduced, channels, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, d, h, w = x.size()
-        squeeze = x.view(b, c, -1).mean(dim=2)  # Global Average Pooling (spatial+temporal)
-        excitation = F.relu(self.fc1(squeeze))
+        # x: (B, C, T, H, W)
+        b, c, t, h, w = x.size()
+        squeeze = x.view(b, c, -1).mean(dim=2)  # Global avg over T,H,W
+        excitation = F.relu(self.fc1(squeeze), inplace=True)
         excitation = torch.sigmoid(self.fc2(excitation))
         excitation = excitation.view(b, c, 1, 1, 1)
         return x * excitation
@@ -22,8 +27,9 @@ class SEBlock(nn.Module):
 
 class BloodFlowCNN(nn.Module):
     """
-    Deep 3D CNN model for speckle pattern blood flow estimation.
-    Designed for research/medical-grade regression tasks on video input.
+    Deep 3D CNN for speckle pattern blood flow estimation.
+    Input: (B, 1, T, H, W)
+    Output: (B,) predicted flow rates.
     """
     def __init__(
         self,
@@ -33,69 +39,56 @@ class BloodFlowCNN(nn.Module):
         dropout_rate: float = 0.4,
         input_norm: bool = True,
     ):
-        super(BloodFlowCNN, self).__init__()
+        super().__init__()
 
         self.input_norm = nn.BatchNorm3d(input_channels) if input_norm else nn.Identity()
 
+        # 3D CNN encoder
         self.encoder = nn.Sequential(
-            nn.Conv3d(input_channels, base_channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv3d(input_channels, base_channels, kernel_size=3, padding=1),
             nn.BatchNorm3d(base_channels),
             nn.LeakyReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=(1, 2, 2)),
+            nn.MaxPool3d((1, 2, 2)),
 
-            nn.Conv3d(base_channels, base_channels * 2, kernel_size=3, stride=1, padding=1),
+            nn.Conv3d(base_channels, base_channels * 2, kernel_size=3, padding=1),
             nn.BatchNorm3d(base_channels * 2),
             nn.LeakyReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=(2, 2, 2)),
+            nn.MaxPool3d((2, 2, 2)),
 
-            nn.Conv3d(base_channels * 2, base_channels * 4, kernel_size=3, stride=1, padding=1),
+            nn.Conv3d(base_channels * 2, base_channels * 4, kernel_size=3, padding=1),
             nn.BatchNorm3d(base_channels * 4),
             nn.LeakyReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=(2, 2, 2)),
+            nn.MaxPool3d((2, 2, 2)),
 
-            # SEBlock inserted here to leverage spatial features better
             SEBlock(base_channels * 4, reduction=reduction),
 
-            nn.Conv3d(base_channels * 4, base_channels * 8, kernel_size=3, stride=1, padding=1),
+            nn.Conv3d(base_channels * 4, base_channels * 8, kernel_size=3, padding=1),
             nn.BatchNorm3d(base_channels * 8),
             nn.LeakyReLU(inplace=True),
-            nn.AdaptiveAvgPool3d((1, 1, 1)),  # output: [B, C, 1, 1, 1]
+            nn.AdaptiveAvgPool3d((1, 1, 1)),
         )
 
-        # We'll infer the flattened feature size dynamically after a dummy forward
-        self._feature_dim: Optional[int] = None
-
+        # Fully connected regression head
         self.dropout = nn.Dropout(dropout_rate)
         self.fc1 = nn.Linear(base_channels * 8, base_channels * 4)
         self.relu = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(base_channels * 4, 1)  # Regression output
+        self.fc2 = nn.Linear(base_channels * 4, 1)
 
         self._initialize_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Validate input shape
         self._validate_input_shape(x)
-
         x = self.input_norm(x)
         x = self.encoder(x)
-        x = torch.flatten(x, 1)  # Flatten all except batch dim
-
-        # Lazy init feature dim if not set (allows dynamic input size)
-        if self._feature_dim is None:
-            self._feature_dim = x.size(1)
-            # Re-initialize fully connected layers with correct input dim
-            self.fc1 = nn.Linear(self._feature_dim, self.fc1.out_features).to(x.device)
-            self.fc2 = nn.Linear(self.fc1.out_features, 1).to(x.device)
-            self._initialize_weights()
-
+        x = torch.flatten(x, 1)
         x = self.dropout(x)
         x = self.fc1(x)
         x = self.relu(x)
         x = self.fc2(x)
-        return x
+        return x.squeeze(-1)
 
     def _initialize_weights(self):
-        """Initialize weights with Kaiming normal."""
+        """Kaiming-normal initialization for Conv and Linear layers."""
         for m in self.modules():
             if isinstance(m, (nn.Conv3d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
@@ -108,33 +101,29 @@ class BloodFlowCNN(nn.Module):
     @staticmethod
     def _validate_input_shape(x: torch.Tensor):
         if x.ndim != 5:
-            raise ValueError(f"Expected 5D input (B,C,T,H,W), got {x.ndim}D")
+            raise ValueError(f"Expected input shape (B, C, T, H, W), got {x.shape}")
         if x.size(1) != 1:
-            raise ValueError(f"Expected input with 1 channel, got {x.size(1)}")
+            raise ValueError(f"Expected single channel input, got {x.size(1)} channels.")
 
     def freeze_encoder(self):
-        """Freeze encoder layers for transfer learning."""
         for param in self.encoder.parameters():
             param.requires_grad = False
 
     def unfreeze_encoder(self):
-        """Unfreeze encoder layers."""
         for param in self.encoder.parameters():
             param.requires_grad = True
 
 
-def test_model():
-    """
-    Sanity check: Runs a forward pass with dummy input on available device.
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BloodFlowCNN().to(device)
-    model.eval()
-    dummy_input = torch.randn(2, 1, 16, 128, 128).to(device)  # [B, C, T, H, W]
-    with torch.no_grad():
-        output = model(dummy_input)
-    print("Output shape:", output.shape)
+def get_model(**kwargs) -> BloodFlowCNN:
+    """Factory function to create BloodFlowCNN."""
+    return BloodFlowCNN(**kwargs)
 
 
 if __name__ == "__main__":
-    test_model()
+    # Quick sanity test
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = get_model().to(device)
+    dummy_input = torch.randn(2, 1, 16, 128, 128).to(device)
+    with torch.no_grad():
+        output = model(dummy_input)
+    print("Output shape:", output.shape)
