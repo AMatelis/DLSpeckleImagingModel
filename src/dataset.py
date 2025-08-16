@@ -1,7 +1,6 @@
 import os
 import re
-import logging
-from typing import List, Tuple, Optional, Callable
+from typing import Optional, List, Tuple
 
 import cv2
 import numpy as np
@@ -9,178 +8,138 @@ import torch
 from torch.utils.data import Dataset
 
 
-def extract_flowrate_from_filename(filename: str) -> Optional[float]:
-    """
-    Extracts the numeric flowrate value from the filename.
-    Assumes the first number in the filename corresponds to the flowrate.
-    """
-    matches = re.findall(r"(\d+\.?\d*)", filename)
-    if matches:
-        try:
-            return float(matches[0])
-        except ValueError:
-            logging.warning(f"Could not convert extracted flowrate to float from filename: {filename}")
-            return None
-    return None
+def extract_flow_from_filename(fname: str) -> Optional[float]:
+    """Extract numeric flow rate from filename like '5ul.avi', 'flow_5.0.avi'."""
+    m = re.search(r"([0-9]+\.?[0-9]*)", fname)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
 
 
-def load_video_frames(video_path: str) -> List[np.ndarray]:
-    """
-    Loads video frames as grayscale numpy arrays from the given video file.
-    Raises errors if file not found or no frames are extracted.
-    """
-    if not os.path.isfile(video_path):
-        raise FileNotFoundError(f"Video file not found: {video_path}")
-
+def read_video_segment(video_path: str, start: int, length: int) -> List[np.ndarray]:
+    """Read a segment of frames from a video in grayscale starting at `start`."""
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"[ERROR] Could not open video: {video_path}")
+
+    # Jump directly to the start frame
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+
     frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
+    for _ in range(length):
+        ok, frame = cap.read()
+        if not ok:
             break
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frames.append(gray)
+        if frame.ndim == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frames.append(frame.astype(np.float32))
+
     cap.release()
-
-    if len(frames) == 0:
-        raise RuntimeError(f"No frames extracted from video: {video_path}")
-
+    if len(frames) < length:
+        raise RuntimeError(f"[ERROR] Not enough frames in segment from: {video_path}")
     return frames
-
-
-def normalize_frames(frames: List[np.ndarray], mode: str = "scale") -> np.ndarray:
-    """
-    Normalize frames with either scaling [0,1] or z-score normalization.
-    Returns numpy array of shape (T, H, W), dtype float32.
-    """
-    stack = np.stack(frames).astype(np.float32)
-    if mode == "scale":
-        return stack / 255.0
-    elif mode == "zscore":
-        mean = stack.mean()
-        std = stack.std()
-        if std > 1e-6:
-            return (stack - mean) / std
-        else:
-            logging.warning("Std deviation too low for z-score normalization, returning unnormalized frames.")
-            return stack
-    else:
-        raise ValueError(f"Unknown normalization mode: {mode}")
 
 
 class SpeckleDataset(Dataset):
     """
-    PyTorch Dataset for loading speckle video frame sequences and their flowrate labels.
+    Memory-efficient speckle dataset that loads only the frames needed for each sample.
 
     Args:
-        data_dir (str): Path to directory containing .avi videos.
-        sequence_len (int): Number of consecutive frames per sample.
-        stride (int): Step size between sequences.
-        normalize_mode (str): "scale" or "zscore" normalization.
-        transform (Callable, optional): Optional transform applied on tensor.
-        cache_frames (bool): If True, cache entire video frames in memory (uses more RAM).
+        folder (str): Path to folder containing .avi videos.
+        sequence_len (int): Frames per sequence.
+        stride (int): Step size for sliding window extraction.
+        normalize (str): 'scale' or 'zscore' normalization.
+        cache_videos (bool): If True, caches full videos in memory (RAM heavy).
     """
 
     def __init__(
         self,
-        data_dir: str,
-        sequence_len: int,
+        folder: str,
+        sequence_len: int = 5,
         stride: int = 1,
-        normalize_mode: str = "scale",
-        transform: Optional[Callable] = None,
-        cache_frames: bool = False,
+        normalize: str = 'scale',
+        cache_videos: bool = False
     ):
-        super().__init__()
-
-        self.data_dir = data_dir
+        self.folder = folder
         self.sequence_len = sequence_len
         self.stride = stride
-        self.normalize_mode = normalize_mode
-        self.transform = transform
-        self.cache_frames = cache_frames
+        self.normalize = normalize
+        self.cache_videos = cache_videos
 
-        self.samples: List[Tuple[str, int]] = []
-        self.flowrates: List[float] = []
-        self._video_cache: dict[str, List[np.ndarray]] = {}
+        self.samples: List[Tuple[str, int, float]] = []
+        self.cache = {}
 
-        self._prepare_index()
+        if not os.path.isdir(folder):
+            raise NotADirectoryError(f"[ERROR] Dataset folder not found: {folder}")
 
-    def _prepare_index(self) -> None:
-        if not os.path.isdir(self.data_dir):
-            raise FileNotFoundError(f"Data directory not found: {self.data_dir}")
+        files = sorted([f for f in os.listdir(folder) if f.lower().endswith('.avi')])
+        if not files:
+            raise RuntimeError(f"[ERROR] No .avi files found in {folder}")
 
-        video_files = sorted(f for f in os.listdir(self.data_dir) if f.lower().endswith(".avi"))
-        if not video_files:
-            logging.warning(f"No .avi videos found in {self.data_dir}")
-
-        for vf in video_files:
-            flowrate = extract_flowrate_from_filename(vf)
-            if flowrate is None:
-                logging.warning(f"Skipping {vf}: Could not extract flowrate.")
+        for fn in files:
+            flow = extract_flow_from_filename(fn)
+            if flow is None:
+                print(f"[WARN] Could not parse flow rate from filename: {fn}")
                 continue
 
-            video_path = os.path.join(self.data_dir, vf)
-            try:
-                if self.cache_frames:
-                    if video_path not in self._video_cache:
-                        self._video_cache[video_path] = load_video_frames(video_path)
-                    frames = self._video_cache[video_path]
-                else:
-                    frames = load_video_frames(video_path)
+            path = os.path.join(folder, fn)
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                print(f"[WARN] Skipping {fn}: cannot open")
+                continue
 
-                if len(frames) < self.sequence_len:
-                    logging.warning(f"Skipping {vf}: video length {len(frames)} < sequence length {self.sequence_len}")
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+
+            if frame_count < sequence_len:
+                print(f"[WARN] Skipping {fn}: only {frame_count} frames (< {sequence_len})")
+                continue
+
+            if cache_videos:
+                try:
+                    self.cache[path] = read_video_segment(path, 0, frame_count)
+                except Exception as e:
+                    print(f"[WARN] Skipping {fn} due to cache error: {e}")
                     continue
 
-                for start_idx in range(0, len(frames) - self.sequence_len + 1, self.stride):
-                    self.samples.append((video_path, start_idx))
-                    self.flowrates.append(flowrate)
+            # Build sample index list
+            for start in range(0, frame_count - sequence_len + 1, stride):
+                self.samples.append((path, start, float(flow)))
 
-            except (FileNotFoundError, RuntimeError) as e:
-                logging.warning(f"Skipping {vf} due to error: {e}")
+        if not self.samples:
+            raise RuntimeError(f"[ERROR] No valid sequences found in {folder}")
+
+        print(f"[INFO] Prepared {len(self.samples)} sequences from {len(files)} videos.")
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        video_path, start_idx = self.samples[idx]
+    def _normalize_clip(self, arr: np.ndarray) -> np.ndarray:
+        """Apply selected normalization mode."""
+        if self.normalize == 'scale':
+            arr = arr / 255.0
+        elif self.normalize == 'zscore':
+            mu, sd = arr.mean(), arr.std()
+            arr = (arr - mu) / (sd + 1e-8)
+        return arr.astype(np.float32)
 
-        if self.cache_frames and video_path in self._video_cache:
-            frames = self._video_cache[video_path][start_idx : start_idx + self.sequence_len]
+    def _get_clip(self, path: str, start: int) -> torch.Tensor:
+        """Retrieve a clip (1, T, H, W) from cache or disk."""
+        if path in self.cache:
+            frames = self.cache[path][start:start + self.sequence_len]
         else:
-            all_frames = load_video_frames(video_path)
-            frames = all_frames[start_idx : start_idx + self.sequence_len]
+            frames = read_video_segment(path, start, self.sequence_len)
 
-        norm_frames = normalize_frames(frames, mode=self.normalize_mode)
-        # Add channel dimension (C=1), result shape: (1, T, H, W)
-        tensor = torch.from_numpy(norm_frames).unsqueeze(0).float()
+        arr = np.stack(frames, axis=0)  # (T, H, W)
+        arr = self._normalize_clip(arr)
+        arr = arr[None, ...]  # (1, T, H, W)
+        return torch.from_numpy(arr)
 
-        if self.transform:
-            tensor = self.transform(tensor)
-
-        label = torch.tensor(self.flowrates[idx], dtype=torch.float32)
-
-        return tensor, label
-
-
-if __name__ == "__main__":
-    import sys
-
-    logging.basicConfig(level=logging.INFO)
-    if len(sys.argv) != 2:
-        print("Usage: python dataset.py <path_to_video_folder>")
-        sys.exit(1)
-
-    dataset = SpeckleDataset(
-        data_dir=sys.argv[1],
-        sequence_len=5,
-        stride=1,
-        normalize_mode="scale",
-        cache_frames=False,
-    )
-
-    print(f"Dataset initialized with {len(dataset)} samples.")
-
-    sample_tensor, sample_label = dataset[0]
-    print(f"Example sample tensor shape: {sample_tensor.shape}")
-    print(f"Example label: {sample_label.item()}")
+    def __getitem__(self, idx: int):
+        path, start, flow = self.samples[idx]
+        x = self._get_clip(path, start)
+        y = torch.tensor(flow, dtype=torch.float32)
+        return x, y
