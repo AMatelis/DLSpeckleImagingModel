@@ -1,505 +1,448 @@
 import os
-import random
-import logging
+import sys
+import time
 import argparse
-import csv
-from typing import Optional, List, Tuple, Callable
+import logging
+from typing import Tuple, List, Optional
 
-import cv2
 import numpy as np
+import joblib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import joblib
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
+from torch import amp
+import warnings
 
-# ------------------------------
-# Utils: Reproducibility & Logging
-# ------------------------------
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.cuda.amp.autocast")
+
+from src.dataloader import create_dataloaders
+from models.bloodflow_cnn import get_model
+
+# ----------------------
+# Utilities
+# ----------------------
 
 def set_seed(seed: int = 42) -> None:
-    random.seed(seed)
+    import random
     np.random.seed(seed)
+    random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+def setup_logger(output_dir: str) -> logging.Logger:
+    os.makedirs(output_dir, exist_ok=True)
+    logger = logging.getLogger("bloodflow_train")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        fmt = logging.Formatter("[%(asctime)s][%(levelname)s] %(message)s")
+        fh = logging.FileHandler(os.path.join(output_dir, "training.log"))
+        fh.setFormatter(fmt)
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+    return logger
 
-def setup_logger(log_dir: str) -> logging.Logger:
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "training.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s][%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ],
-    )
-    return logging.getLogger()
+def atomic_save_scaler(scaler: StandardScaler, path: str, logger: Optional[logging.Logger] = None) -> None:
+    temp_path = path + ".tmp"
+    try:
+        with open(temp_path, "wb") as f:
+            joblib.dump(scaler, f)
+        os.replace(temp_path, path)
+        if logger:
+            logger.info(f"Scaler saved to {path}")
+    except Exception as e:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        if logger:
+            logger.error(f"Failed to save scaler to {path}: {e}")
+        raise
 
-
-def save_csv_predictions(preds: List[float], targets: List[float], filepath: str) -> None:
-    with open(filepath, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Index", "TrueFlowRate", "PredictedFlowRate", "AbsError", "SquaredError", "RelError(%)", "FlowClass"])
+def save_predictions_csv(preds: List[float], targets: List[float], out_path: str) -> None:
+    import csv
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        mse = mean_squared_error(targets, preds) if preds else float("nan")
+        mae = mean_absolute_error(targets, preds) if preds else float("nan")
+        r2 = r2_score(targets, preds) if preds else float("nan")
+        w.writerow(["Summary"])
+        w.writerow(["MSE", f"{mse:.6f}"])
+        w.writerow(["MAE", f"{mae:.6f}"])
+        w.writerow(["R2", f"{r2:.6f}"])
+        w.writerow([])
+        w.writerow(["Index", "TrueFlow", "PredictedFlow", "AbsError", "SquaredError", "RelErrorPercent", "Class"])
         for i, (t, p) in enumerate(zip(targets, preds)):
-            abs_err = abs(t - p)
-            sq_err = abs_err ** 2
-            rel_err = (abs_err / t * 100) if t != 0 else 0.0
-            flow_class = classify_flowrate(t)
-            writer.writerow([i, round(t, 2), round(p, 2), round(abs_err, 2), round(sq_err, 2), round(rel_err, 2), flow_class])
+            abs_e = abs(t - p)
+            sq = abs_e ** 2
+            rel = (abs_e / t * 100.0) if t != 0 else 0.0
+            cls = "Low" if t < 20 else ("Medium" if t < 200 else "High")
+            w.writerow([i, f"{t:.6f}", f"{p:.6f}", f"{abs_e:.6f}", f"{sq:.6f}", f"{rel:.2f}", cls])
 
-
-def classify_flowrate(value: float) -> str:
-    if value < 20:
-        return "Low"
-    elif value < 200:
-        return "Medium"
-    else:
-        return "High"
-
-
-def plot_scatter(true_vals: List[float], pred_vals: List[float], filepath: str) -> None:
-    plt.figure(figsize=(6, 6))
-    plt.scatter(true_vals, pred_vals, alpha=0.7, edgecolors='k')
-    min_val, max_val = min(true_vals), max(true_vals)
-    plt.plot([min_val, max_val], [min_val, max_val], 'r--')
-    plt.xlabel("True Flow Rate (µL/min)")
-    plt.ylabel("Predicted Flow Rate (µL/min)")
-    plt.title("Predicted vs True Flow Rate")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(filepath)
-    plt.close()
-
-
-def plot_loss_curve(losses: List[float], filepath: str) -> None:
+def plot_loss_curve(train_losses: List[float], out_path: str) -> None:
     plt.figure()
-    plt.plot(range(1, len(losses) + 1), losses, marker='o')
+    plt.plot(range(1, len(train_losses) + 1), train_losses, marker="o")
     plt.xlabel("Epoch")
-    plt.ylabel("Training MSE Loss")
+    plt.ylabel("Training Loss (MSE)")
     plt.title("Training Loss Curve")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(filepath)
+    plt.savefig(out_path)
     plt.close()
 
+def plot_pred_scatter(targets: List[float], preds: List[float], out_path: str) -> None:
+    if not targets or not preds:
+        return
+    plt.figure(figsize=(6, 6))
+    plt.scatter(targets, preds, alpha=0.7, edgecolors="k")
+    mn = min(min(targets), min(preds))
+    mx = max(max(targets), max(preds))
+    plt.plot([mn, mx], [mn, mx], "r--", label="Ideal")
+    plt.xlabel("True Flow (uL/min)")
+    plt.ylabel("Predicted Flow (uL/min)")
+    plt.title("Predicted vs True")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
 
-# ------------------------------
-# Dataset with Lazy Loading and Augmentation Hooks
-# ------------------------------
-
-def extract_flowrate_from_filename(filename: str) -> Optional[float]:
-    import re
-    matches = re.findall(r"(\d+\.?\d*)", filename)
-    if matches:
-        return float(matches[0])
-    return None
-
-
-def load_video_frames(video_path: str) -> List[np.ndarray]:
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video missing: {video_path}")
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frames.append(gray)
-    cap.release()
-    if len(frames) == 0:
-        raise RuntimeError(f"No frames extracted: {video_path}")
-    return frames
-
-
-def normalize_frames(frames: List[np.ndarray], mode: str = "scale") -> np.ndarray:
-    stack = np.stack(frames).astype(np.float32)
-    if mode == "scale":
-        return stack / 255.0
-    elif mode == "zscore":
-        mean = stack.mean()
-        std = stack.std()
-        return (stack - mean) / std if std > 1e-6 else stack
-    else:
-        raise ValueError(f"Unknown normalization mode: {mode}")
-
-
-class SpeckleDataset(Dataset):
-    def __init__(
-        self,
-        data_dir: str,
-        sequence_len: int,
-        stride: int,
-        normalize_mode: str = "scale",
-        transform: Optional[Callable] = None,
-        cache_frames: bool = False
-    ):
-        self.data_dir = data_dir
-        self.sequence_len = sequence_len
-        self.stride = stride
-        self.normalize_mode = normalize_mode
-        self.transform = transform
-        self.cache_frames = cache_frames
-
-        self.samples: List[Tuple[str, int]] = []
-        self.flowrates: List[float] = []
-        self.video_frames_cache = {}
-
-        self._prepare_index()
-
-    def _prepare_index(self) -> None:
-        video_files = [f for f in os.listdir(self.data_dir) if f.lower().endswith(".avi")]
-        video_files.sort()
-        for vf in video_files:
-            flowrate = extract_flowrate_from_filename(vf)
-            if flowrate is None:
-                logging.warning(f"Cannot extract flowrate from filename: {vf}, skipping.")
-                continue
-            video_path = os.path.join(self.data_dir, vf)
-            try:
-                if self.cache_frames and video_path not in self.video_frames_cache:
-                    frames = load_video_frames(video_path)
-                    self.video_frames_cache[video_path] = frames
-                else:
-                    frames = load_video_frames(video_path)
-            except Exception as e:
-                logging.warning(f"Error loading video {vf}: {e}, skipping.")
-                continue
-            if len(frames) < self.sequence_len:
-                logging.warning(f"Video {vf} too short ({len(frames)} frames), skipping.")
-                continue
-            for start_idx in range(0, len(frames) - self.sequence_len + 1, self.stride):
-                self.samples.append((video_path, start_idx))
-                self.flowrates.append(flowrate)
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        video_path, start_idx = self.samples[idx]
-        if self.cache_frames and video_path in self.video_frames_cache:
-            frames = self.video_frames_cache[video_path][start_idx:start_idx + self.sequence_len]
-        else:
-            frames_all = load_video_frames(video_path)
-            frames = frames_all[start_idx:start_idx + self.sequence_len]
-
-        seq_norm = normalize_frames(frames, mode=self.normalize_mode)
-        seq_norm = seq_norm[:, np.newaxis, :, :]
-        tensor = torch.from_numpy(seq_norm).float().permute(1, 0, 2, 3)
-
-        if self.transform is not None:
-            tensor = self.transform(tensor)
-
-        label = torch.tensor(self.flowrates[idx], dtype=torch.float32)
-        return tensor, label
-
-
-# ------------------------------
-# Model: 3D CNN with Positive Output Activation
-# ------------------------------
-
-class SpeckleRegressor(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv3d(1, 16, kernel_size=3, padding=1),
-            nn.BatchNorm3d(16),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
-            nn.Conv3d(16, 32, kernel_size=3, padding=1),
-            nn.BatchNorm3d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
-            nn.Conv3d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool3d(1),
-        )
-        self.regressor = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64, 32),
-            nn.ReLU(inplace=True),
-            nn.Linear(32, 1),
-            nn.Softplus()
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = self.regressor(x)
-        return x.squeeze(-1)
-
-
-# ------------------------------
-# Training & Validation Loops
-# ------------------------------
+# ----------------------
+# Train / Validate helpers
+# ----------------------
 
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
-    criterion: nn.Module,
     optimizer: optim.Optimizer,
-    scaler: StandardScaler,
+    criterion: nn.Module,
     device: torch.device,
+    scaler: StandardScaler,
+    amp_scaler: Optional[GradScaler],
     grad_clip: float,
-    scaler_amp: torch.cuda.amp.GradScaler
+    logger: Optional[logging.Logger] = None,
 ) -> float:
     model.train()
     running_loss = 0.0
-    for inputs, targets in tqdm(loader, desc="Training", leave=False):
-        inputs, targets = inputs.to(device), targets.to(device)
-        targets_np = targets.cpu().numpy().reshape(-1, 1)
-        targets_scaled = torch.tensor(scaler.transform(targets_np), dtype=torch.float32, device=device).flatten()
+    total = 0
+    for xb, yb in tqdm(loader, desc="train", leave=False, dynamic_ncols=True):
+        xb = xb.to(device, non_blocking=True)
+        yb_np = yb.cpu().numpy().reshape(-1, 1)
+        yb_scaled = torch.tensor(scaler.transform(yb_np).reshape(-1), dtype=torch.float32, device=device)
 
-        optimizer.zero_grad()
-        with torch.amp.autocast(device_type='cpu'):
-            outputs = model(inputs).flatten()
-            loss = criterion(outputs, targets_scaled)
+        optimizer.zero_grad(set_to_none=True)
+        with amp.autocast("cuda", enabled=(amp_scaler is not None and device.type == "cuda")):
+            preds = model(xb).view(-1)
+            loss = criterion(preds, yb_scaled)
 
-        scaler_amp.scale(loss).backward()
-        if grad_clip > 0:
-            scaler_amp.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler_amp.step(optimizer)
-        scaler_amp.update()
+        if amp_scaler:
+            amp_scaler.scale(loss).backward()
+            if grad_clip > 0:
+                amp_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            amp_scaler.step(optimizer)
+            amp_scaler.update()
+        else:
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
 
-        running_loss += loss.item() * inputs.size(0)
+        running_loss += loss.item() * xb.size(0)
+        total += xb.size(0)
 
-    return running_loss / len(loader.dataset)
-
+    avg_loss = running_loss / total if total > 0 else float("nan")
+    if logger:
+        logger.info(f"Train Loss: {avg_loss:.6f}")
+    return avg_loss
 
 def validate(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
+    device: torch.device,
     scaler: StandardScaler,
-    device: torch.device
+    amp_scaler: Optional[GradScaler],
 ) -> Tuple[float, List[float], List[float]]:
     model.eval()
-    preds, targets_all = [], []
-    total_loss = 0.0
+    running_loss = 0.0
+    total = 0
+    all_preds: List[float] = []
+    all_targets: List[float] = []
     with torch.no_grad():
-        for inputs, targets in loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            with torch.cuda.amp.autocast():
-                outputs = model(inputs).flatten()
-                targets_np = targets.cpu().numpy().reshape(-1, 1)
-                targets_scaled = scaler.transform(targets_np).flatten()
-                loss = criterion(outputs, torch.tensor(targets_scaled, dtype=torch.float32, device=device))
-            total_loss += loss.item() * inputs.size(0)
+        for xb, yb in tqdm(loader, desc="val", leave=False, dynamic_ncols=True):
+            xb = xb.to(device, non_blocking=True)
+            yb_np = yb.cpu().numpy().reshape(-1, 1)
+            yb_scaled = torch.tensor(scaler.transform(yb_np).reshape(-1), dtype=torch.float32, device=device)
 
-            preds_batch = scaler.inverse_transform(outputs.cpu().numpy().reshape(-1, 1)).flatten()
-            preds.extend(preds_batch)
-            targets_all.extend(targets.cpu().numpy().flatten())
+            with amp.autocast("cuda", enabled=(amp_scaler is not None and device.type == "cuda")):
+                out = model(xb).view(-1)
+                loss = criterion(out, yb_scaled)
 
-    avg_loss = total_loss / len(loader.dataset)
-    return avg_loss, preds, targets_all
+            running_loss += loss.item() * xb.size(0)
+            total += xb.size(0)
 
+            out_cpu = out.detach().cpu().numpy().reshape(-1, 1)
+            all_preds.extend(scaler.inverse_transform(out_cpu).reshape(-1).tolist())
+            all_targets.extend(yb_np.reshape(-1).tolist())
 
-def train_and_evaluate(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler._LRScheduler,
-    device: torch.device,
-    num_epochs: int,
-    checkpoint_dir: str,
-    output_dir: str,
-    patience: int,
-    val_samples: int,
-    grad_clip: float,
+    avg_loss = running_loss / total if total > 0 else float("nan")
+    return avg_loss, all_preds, all_targets
+
+# ----------------------
+# Main train / evaluate
+# ----------------------
+
+def train(
+    data_dir,
+    output_dir,
+    batch_size,
+    sequence_len,
+    stride,
+    num_epochs,
+    lr,
+    weight_decay,
+    patience,
+    val_samples,
+    test_split,
+    num_workers,
+    grad_clip,
+    seed,
+    normalize,
+    cache_videos,
+    augment_train,
+    safe_mode=False,
 ):
-    logger = logging.getLogger()
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    logger.info("Fitting target scaler on training labels...")
-    train_targets = []
+    set_seed(seed)
+    os.makedirs(output_dir, exist_ok=True)
+    checkpoints_dir = os.path.join(output_dir, "checkpoints")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
+    logger = setup_logger(output_dir)
+    logger.info("Preparing dataloaders...")
+
+    train_loader, val_loader, _ = create_dataloaders(
+        data_folder=data_dir,
+        batch_size=batch_size,
+        sequence_len=sequence_len,
+        test_split=test_split,
+        stride=stride,
+        num_workers=num_workers,
+        normalize_mode=normalize,
+        cache_file=None if not cache_videos else os.path.join(output_dir, "dataset_cache.npz"),
+        augment_train=augment_train,
+        safe_mode=safe_mode
+    )
+
+    logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = get_model()
+    model.to(device)
+    logger.info(f"Model created and moved to {device}")
+
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=4)
+
+    # Fit scaler on training labels
+    target_list = []
     for _, y in train_loader:
-        train_targets.extend(y.numpy())
-    scaler = StandardScaler().fit(np.array(train_targets).reshape(-1, 1))
-    joblib.dump(scaler, os.path.join(output_dir, "scaler.pkl"))
-    logger.info("Scaler saved.")
+        target_list.append(y.cpu().numpy().reshape(-1, 1))
+    if not target_list:
+        raise RuntimeError("No training labels found to fit scaler.")
+    train_targets = np.concatenate(target_list, axis=0)
+    scaler = StandardScaler()
+    scaler.fit(train_targets)
+    atomic_save_scaler(scaler, os.path.join(output_dir, "scaler.pkl"), logger)
 
-    best_val_loss = float('inf')
+    amp_scaler = GradScaler(enabled=(device.type == "cuda"))
+    best_val = float("inf")
     epochs_no_improve = 0
-    train_losses = []
-    scaler_amp = torch.cuda.amp.GradScaler()  # Mixed precision
-    best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
+    train_losses: List[float] = []
+    best_ckpt = os.path.join(checkpoints_dir, "best_model.pth")
 
-    writer = SummaryWriter(log_dir=output_dir)
-
+    logger.info("Starting training loop...")
     for epoch in range(1, num_epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, grad_clip, scaler_amp)
-        val_loss, val_preds, val_targets = validate(model, val_loader, criterion, scaler, device)
+        t0 = time.time()
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, scaler, amp_scaler, grad_clip, logger)
+        val_loss, val_preds, val_targets = validate(model, val_loader, criterion, device, scaler, amp_scaler)
         train_losses.append(train_loss)
 
-        logger.info(f"[Epoch {epoch}] Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
-
-        writer.add_scalar("Loss/Train", train_loss, epoch)
-        writer.add_scalar("Loss/Val", val_loss, epoch)
-        writer.add_scalar("LearningRate", optimizer.param_groups[0]["lr"], epoch)
-
-        epoch_pred_path = os.path.join(output_dir, f"predictions_epoch_{epoch}.csv")
-        save_csv_predictions(val_preds[:val_samples], val_targets[:val_samples], epoch_pred_path)
-
+        logger.info(f"Epoch {epoch:03d} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Time: {time.time() - t0:.1f}s")
         scheduler.step(val_loss)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), best_model_path)
-            logger.info(f"Saved new best model at epoch {epoch}")
+        save_predictions_csv(val_preds[:val_samples], val_targets[:val_samples], os.path.join(output_dir, f"predictions_epoch_{epoch}.csv"))
+
+        if val_loss < best_val:
+            best_val = val_loss
             epochs_no_improve = 0
+            torch.save({"model_state_dict": model.state_dict()}, best_ckpt)
+            logger.info(f"Saved best model to {best_ckpt}")
         else:
             epochs_no_improve += 1
 
         if epoch % 5 == 0:
-            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
-            torch.save(model.state_dict(), checkpoint_path)
-            logger.info(f"Saved checkpoint at epoch {epoch}")
+            cp = os.path.join(checkpoints_dir, f"checkpoint_epoch_{epoch}.pth")
+            torch.save({"model_state_dict": model.state_dict()}, cp)
+            logger.info(f"Saved periodic checkpoint {cp}")
 
-        if epochs_no_improve >= patience:
-            logger.info("Early stopping triggered.")
-            break
+        # Early stopping disabled
+        # if epochs_no_improve >= patience:
+        #     logger.info("Early stopping triggered.")
+        #     break
 
-    writer.close()
+    # Final evaluation
+    if os.path.exists(best_ckpt):
+        ck = torch.load(best_ckpt, map_location=device)
+        model.load_state_dict(ck["model_state_dict"])
+        logger.info("Loaded best model for final evaluation.")
 
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
-    model.eval()
+    final_loss, final_preds, final_targets = validate(model, val_loader, criterion, device, scaler, amp_scaler)
+    logger.info(f"Final metrics | MSE: {mean_squared_error(final_targets, final_preds):.6f} | MAE: {mean_absolute_error(final_targets, final_preds):.6f} | R2: {r2_score(final_targets, final_preds):.6f}")
 
-    _, final_preds, final_targets = validate(model, val_loader, criterion, scaler, device)
-    mse = mean_squared_error(final_targets, final_preds)
-    mae = mean_absolute_error(final_targets, final_preds)
-    r2 = r2_score(final_targets, final_preds)
-
-    logger.info("Final validation metrics:")
-    logger.info(f"  MSE: {mse:.4f}")
-    logger.info(f"  MAE: {mae:.4f}")
-    logger.info(f"  R2:  {r2:.4f}")
-
-    final_pred_path = os.path.join(output_dir, "final_predictions.csv")
-    save_csv_predictions(final_preds[:val_samples], final_targets[:val_samples], final_pred_path)
-
-    plot_scatter(final_targets, final_preds, os.path.join(output_dir, "pred_vs_true.png"))
+    save_predictions_csv(final_preds[:val_samples], final_targets[:val_samples], os.path.join(output_dir, "final_predictions.csv"))
+    plot_pred_scatter(final_targets, final_preds, os.path.join(output_dir, "pred_vs_true.png"))
     plot_loss_curve(train_losses, os.path.join(output_dir, "training_loss.png"))
 
     logger.info("Training complete.")
 
+# ----------------------
+# Evaluation
+# ----------------------
 
-# ------------------------------
-# DataLoader creation
-# ------------------------------
-
-def create_data_loaders(
+def evaluate(
+    checkpoint: str,
     data_dir: str,
+    output_dir: str,
     batch_size: int,
     sequence_len: int,
     stride: int,
-    normalize_mode: str,
-    test_split: float,
     num_workers: int,
-    transform: Optional[Callable] = None,
-    cache_frames: bool = False,
-) -> Tuple[DataLoader, DataLoader]:
-    dataset = SpeckleDataset(
-        data_dir=data_dir,
+    normalize: str,
+    cache_videos: bool,
+):
+    logger = setup_logger(output_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Evaluating on device: {device}")
+
+    if not os.path.exists(checkpoint):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+
+    ck = torch.load(checkpoint, map_location=device)
+    model = get_model()
+    model.to(device)
+
+    if "model_state_dict" in ck:
+        model.load_state_dict(ck["model_state_dict"])
+    else:
+        model.load_state_dict(ck)
+
+    model.eval()
+
+    scaler_path = os.path.join(output_dir, "scaler.pkl")
+    if not os.path.exists(scaler_path):
+        raise RuntimeError("Scaler not found. Train first or provide scaler.pkl")
+    scaler = joblib.load(scaler_path)
+    logger.info(f"Loaded scaler from {scaler_path}")
+
+    _, val_loader, _ = create_dataloaders(
+        data_folder=data_dir,
+        batch_size=batch_size,
         sequence_len=sequence_len,
+        test_split=0.2,
         stride=stride,
-        normalize_mode=normalize_mode,
-        transform=transform,
-        cache_frames=cache_frames,
+        num_workers=num_workers,
+        normalize_mode=normalize,
+        cache_file=None if not cache_videos else os.path.join(output_dir, "dataset_cache.npz"),
+        augment_train=False,
     )
 
-    dataset_size = len(dataset)
-    indices = list(range(dataset_size))
-    random.shuffle(indices)
-    split = int(np.floor(test_split * dataset_size))
-    train_indices, val_indices = indices[split:], indices[:split]
+    _, preds, targets = validate(model, val_loader, nn.MSELoss(), device, scaler, amp_scaler=None)
 
-    train_subset = torch.utils.data.Subset(dataset, train_indices)
-    val_subset = torch.utils.data.Subset(dataset, val_indices)
+    logger.info("Evaluation complete. Saving outputs...")
+    os.makedirs(output_dir, exist_ok=True)
+    save_predictions_csv(preds, targets, os.path.join(output_dir, "eval_predictions.csv"))
+    plot_pred_scatter(targets, preds, os.path.join(output_dir, "eval_pred_vs_true.png"))
+    logger.info(f"Eval metrics | MSE: {mean_squared_error(targets, preds):.6f} | MAE: {mean_absolute_error(targets, preds):.6f} | R2: {r2_score(targets, preds):.6f}")
 
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, drop_last=True,
-                              num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, drop_last=False,
-                            num_workers=num_workers, pin_memory=True)
-
-    return train_loader, val_loader
-
-
-# ------------------------------
-# Main & Argparse
-# ------------------------------
+# ----------------------
+# CLI
+# ----------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Speckle Flow Estimation Training")
-    parser.add_argument("--data_dir", type=str, required=True, help="Path to speckle videos dataset folder")
-    parser.add_argument("--output_dir", type=str, default="./output", help="Output folder for checkpoints, logs, and plots")
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--sequence_len", type=int, default=5)
-    parser.add_argument("--stride", type=int, default=1)
-    parser.add_argument("--normalize_mode", type=str, choices=["scale", "zscore"], default="scale")
-    parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--val_samples", type=int, default=50)
-    parser.add_argument("--test_split", type=float, default=0.2)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="Max norm for gradient clipping. Set 0 to disable.")
-    parser.add_argument("--cache_frames", action='store_true', help="Cache video frames in memory (uses more RAM).")
-    return parser.parse_args()
-
+    p = argparse.ArgumentParser(description="Train or evaluate BloodFlow 3D-CNN")
+    p.add_argument("--mode", choices=["train", "eval"], required=True)
+    p.add_argument("--data_dir", type=str, required=True)
+    p.add_argument("--output_dir", type=str, default="./outputs")
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--sequence_len", type=int, default=5)
+    p.add_argument("--stride", type=int, default=1)
+    p.add_argument("--num_epochs", type=int, default=50)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-5)
+    p.add_argument("--patience", type=int, default=10)
+    p.add_argument("--val_samples", type=int, default=120)
+    p.add_argument("--test_split", type=float, default=0.2)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--normalize", choices=["scale", "zscore"], default="scale")
+    p.add_argument("--cache_videos", action="store_true")
+    p.add_argument("--augment_train", action="store_true")
+    p.add_argument("--checkpoint", type=str, default="")
+    return p.parse_args()
 
 def main():
     args = parse_args()
-    set_seed()
-
-    logger = setup_logger(args.output_dir)
-    logger.info("Starting training...")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-
-    train_loader, val_loader = create_data_loaders(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        sequence_len=args.sequence_len,
-        stride=args.stride,
-        normalize_mode=args.normalize_mode,
-        test_split=args.test_split,
-        num_workers=args.num_workers,
-        cache_frames=args.cache_frames
-    )
-
-    model = SpeckleRegressor().to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, verbose=True)
-
-    train_and_evaluate(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        num_epochs=args.num_epochs,
-        checkpoint_dir=os.path.join(args.output_dir, "checkpoints"),
-        output_dir=args.output_dir,
-        patience=args.patience,
-        val_samples=args.val_samples,
-        grad_clip=args.grad_clip,
-    )
-
+    if args.mode == "train":
+        train(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            batch_size=args.batch_size,
+            sequence_len=args.sequence_len,
+            stride=args.stride,
+            num_epochs=args.num_epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            patience=args.patience,
+            val_samples=args.val_samples,
+            test_split=args.test_split,
+            num_workers=args.num_workers,
+            grad_clip=args.grad_clip,
+            seed=args.seed,
+            normalize=args.normalize,
+            cache_videos=args.cache_videos,
+            augment_train=args.augment_train,
+            safe_mode=False
+        )
+    else:
+        if not args.checkpoint:
+            raise ValueError("Please provide --checkpoint for eval mode")
+        evaluate(
+            checkpoint=args.checkpoint,
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            batch_size=args.batch_size,
+            sequence_len=args.sequence_len,
+            stride=args.stride,
+            num_workers=args.num_workers,
+            normalize=args.normalize,
+            cache_videos=args.cache_videos,
+        )
 
 if __name__ == "__main__":
     main()
